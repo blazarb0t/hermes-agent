@@ -8025,6 +8025,14 @@ class DispatchResult:
     dead/gone worker). See the reconciliation pass for details."""
     spawned: list[tuple[str, str, str]] = field(default_factory=list)
     """List of ``(task_id, assignee, workspace_path)`` triples."""
+    ready_count: int = 0
+    """Number of unclaimed ready/review rows considered by this tick.
+
+    This count lets callers classify a no-spawn tick from the result that
+    produced it, without racing the dispatcher with a second board scan.
+    """
+    skipped_capacity: int = 0
+    """Ready rows deferred because a board/host concurrency cap was full."""
     skipped_unassigned: list[str] = field(default_factory=list)
     """Ready task ids skipped because they have no assignee at all.
     Operator-actionable — usually a misfiled task waiting for routing."""
@@ -9971,6 +9979,17 @@ def _dispatch_once_locked(
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
+    # Capture queue state in this result before any capacity/memory early
+    # return.  Gateway health diagnostics must describe this exact tick, not a
+    # later, racy re-scan of the board.
+    result.ready_count = int(conn.execute(
+        "SELECT COUNT(*) FROM tasks WHERE status = 'ready' AND claim_lock IS NULL"
+    ).fetchone()[0])
+    if review_dispatch_enabled():
+        result.ready_count += int(conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE status = 'review' AND claim_lock IS NULL"
+        ).fetchone()[0])
+
     # Count tasks already running so max_spawn enforces concurrency rather
     # than a per-tick spawn budget. See the docstring above for the full
     # rationale; the short version is that a 60-second tick interval with a
@@ -9988,6 +10007,7 @@ def _dispatch_once_locked(
     # budget so the total number of new workers stays bounded.
     if max_spawn is not None:
         if running_count >= max_spawn:
+            result.skipped_capacity = result.ready_count
             return result
         spawn_budget = max_spawn - running_count
 
@@ -10004,6 +10024,7 @@ def _dispatch_once_locked(
     if max_in_progress is not None:
         total_running = running_count + count_running_tasks_other_boards(board)
         if total_running >= max_in_progress:
+            result.skipped_capacity = result.ready_count
             return result
         remaining = max_in_progress - total_running
         if spawn_budget is None or spawn_budget > remaining:
