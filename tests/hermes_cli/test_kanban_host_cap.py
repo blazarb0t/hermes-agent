@@ -151,6 +151,10 @@ def test_max_in_progress_counts_other_boards(
     # Host budget (2) already consumed by the second board → nothing spawns.
     assert not spawns
     assert not res.spawned
+    # Diagnostics are carried on the same dispatch result.  These assertions
+    # kill mutations that drop either side of the capacity explanation.
+    assert res.ready_count == 1
+    assert res.skipped_capacity == 1
 
 
 def test_max_in_progress_partial_budget_across_boards(
