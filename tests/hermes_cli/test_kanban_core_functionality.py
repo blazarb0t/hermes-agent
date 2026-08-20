@@ -1077,10 +1077,8 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
         # PR salvage (#32857 commit 7): the dispatcher now reaps zombies at
         # the top of each tick via ``asyncio.to_thread(_kb.reap_worker_zombies)``
         # BEFORE the per-board tick work. Each tick now issues 3 ``to_thread``
-        # calls (reaper + ``_tick_once`` + ``_ready_nonempty``) instead of 2,
-        # so this counter must reach 6 to allow the same 2 dispatch ticks the
-        # pre-reaper test expected at 4. Connect counts in the assertion below
-        # are unchanged.
+        # calls (reaper + ``_tick_once`` + review probe), so this counter must
+        # reach 6 to exercise two complete dispatcher ticks.
         calls["to_thread"] += 1
         result = fn(*args, **kwargs)
         if calls["to_thread"] >= 6:
@@ -1106,13 +1104,12 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
     assert sum("not a valid SQLite database" in msg for msg in messages) == 1
     assert not any("tick failed on board" in msg for msg in messages)
     assert not any(record.exc_info for record in caplog.records)
-    # First tick connect (dispatch) + two probes per `_has_ready_work` call
-    # (ready then review, both via _kb.connect). The second dispatch tick
-    # skips the dispatch connect because the corrupt board fingerprint is
-    # disabled, but the ready/review probes still each connect. PR f55d94a1e
-    # added the review-column probe alongside the existing ready-column
-    # probe, bumping this from 3 → 5.
-    assert calls["connect"] == 5
+    # First tick dispatch connects once. The second tick skips dispatch for the
+    # quarantined board, while each tick's review probe still connects once.
+    # DispatchResult is the same-tick source of ready-work truth, so there is no
+    # `_has_ready_work` rescan. This exact count is a regression guard: adding a
+    # ready-work board probe back to either tick increases it.
+    assert calls["connect"] == 3
 
 
 # ---------------------------------------------------------------------------
@@ -1406,5 +1403,3 @@ def test_notify_sub_starts_caught_up_on_active_task(kanban_home):
         assert events == [], "historical events must not replay to a new sub"
     finally:
         conn.close()
-
-

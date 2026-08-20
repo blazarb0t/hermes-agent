@@ -25,6 +25,85 @@ from agent.i18n import t
 logger = logging.getLogger("gateway.run")
 
 
+def _dispatch_no_spawn_diagnostic(results: Any) -> tuple[str, str]:
+    """Classify same-tick DispatchResults and return ``(state, summary)``.
+
+    Summaries contain stable aggregate counts only.  In particular they never
+    copy task ids, assignees, workspace paths, or exception text out of a
+    DispatchResult and into gateway logs.
+    """
+    counts: dict[str, int] = {}
+
+    def add(key: str, value: int | bool) -> None:
+        n = int(value)
+        if n:
+            counts[key] = counts.get(key, 0) + n
+
+    for _slug, result in results or ():
+        if result is None or getattr(result, "spawned", None):
+            continue
+        ready = int(getattr(result, "ready_count", 0) or 0)
+        capacity = int(getattr(result, "skipped_capacity", 0) or 0)
+        profile_capped = len(getattr(result, "skipped_per_profile_capped", ()) or ())
+        nonspawnable = len(getattr(result, "skipped_nonspawnable", ()) or ())
+        locked = bool(getattr(result, "skipped_locked", False))
+        add("ready", ready)
+        add("capacity", capacity)
+        add("profile_capped", profile_capped)
+        add("nonspawnable", nonspawnable)
+        add("locked", locked)
+        pressure = getattr(result, "memory_pressure", None)
+        if pressure:
+            add(f"memory_{pressure}", 1)
+        unassigned = len(getattr(result, "skipped_unassigned", ()) or ())
+        add("unassigned", unassigned)
+        circuit_breaker = len(getattr(result, "auto_blocked", ()) or ())
+        add("circuit_breaker", circuit_breaker)
+        guarded = 0
+        for _task_id, reason in getattr(result, "respawn_guarded", ()) or ():
+            guarded += 1
+            safe_reason = reason if reason in {
+                "blocker_auth", "recent_success", "active_pr", "rate_limited"
+            } else "other"
+            add(f"guard_{safe_reason}", 1)
+        # Capacity, memory, and lock signals apply to the whole tick.  The
+        # row-level buckets must otherwise account for every ready row; any
+        # remainder is genuinely spawnable work with no structured reason.
+        broad_deferral = capacity or locked or bool(pressure)
+        if ready and not broad_deferral:
+            add(
+                "unexplained",
+                max(
+                    ready - profile_capped - nonspawnable - unassigned
+                    - circuit_breaker - guarded,
+                    0,
+                ),
+            )
+
+    actionable = counts.get("unassigned", 0) or counts.get("circuit_breaker", 0) \
+        or counts.get("guard_blocker_auth", 0)
+    benign_keys = {
+        "capacity", "profile_capped", "nonspawnable", "locked",
+        "memory_critical", "memory_elevated", "guard_recent_success",
+        "guard_active_pr", "guard_rate_limited", "guard_other",
+    }
+    justified = any(counts.get(key, 0) for key in benign_keys)
+    if actionable or counts.get("unexplained", 0):
+        state = "actionable"
+    elif justified:
+        state = "benign"
+    else:
+        state = "idle"
+
+    order = (
+        "ready", "capacity", "profile_capped", "nonspawnable", "locked",
+        "memory_critical", "memory_elevated", "guard_recent_success",
+        "guard_active_pr", "guard_rate_limited", "guard_other",
+        "guard_blocker_auth", "unassigned", "circuit_breaker", "unexplained",
+    )
+    return state, " ".join(f"{key}={counts[key]}" for key in order if counts.get(key))
+
+
 def _resolve_auto_decompose_settings(
     load_config: Callable[[], Any],
 ) -> "tuple[bool, int]":
@@ -1398,6 +1477,7 @@ class GatewayKanbanWatchersMixin:
         HEALTH_WINDOW = 6
         bad_ticks = 0
         last_warn_at = 0
+        last_benign_summary = ""
         # Avoid hot-looping corrupt-looking board DBs, but do not suppress
         # same-fingerprint retries forever: transient WAL/open races can
         # surface as "database disk image is malformed" for one tick.
@@ -1536,48 +1616,6 @@ class GatewayKanbanWatchersMixin:
                 out.append((slug, _tick_once_for_board(slug)))
             return out
 
-        def _ready_nonempty() -> bool:
-            """Cheap probe: is there at least one ready+assigned+unclaimed
-            task on ANY board whose assignee maps to a real Hermes profile
-            (i.e. one the dispatcher would actually spawn for)?
-
-            Tasks assigned to control-plane lanes (e.g. ``orion-cc``,
-            ``orion-research``) are pulled by terminals via
-            ``claim_task`` directly and never spawnable, so a queue full
-            of those is "correctly idle", not "stuck". Filtering them out
-            here keeps the stuck-warn fire only on real failures (broken
-            PATH, missing venv, credential loss for a real Hermes profile).
-            """
-            # Only probe the review column when autonomous review dispatch is
-            # actually on. With ``review_dispatch`` off (the default — no
-            # sdlc-review agent), a task parked in 'review' is "correctly idle"
-            # waiting for a human, not a stuck dispatcher; probing it here would
-            # fire a false "dispatcher stuck" warning that never clears. Shares
-            # the exact gate the dispatcher uses so the two can't drift.
-            _review_probe = _kb.review_dispatch_enabled()
-            try:
-                boards = _kb.list_boards(include_archived=False)
-            except Exception:
-                boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
-            for b in boards:
-                slug = b.get("slug") or _kb.DEFAULT_BOARD
-                conn = None
-                try:
-                    conn = _kb.connect(board=slug)
-                    if _kb.has_spawnable_ready(conn):
-                        return True
-                    if _review_probe and _kb.has_spawnable_review(conn):
-                        return True
-                except Exception:
-                    continue
-                finally:
-                    if conn is not None:
-                        try:
-                            conn.close()
-                        except Exception:
-                            pass
-            return False
-
         # Auto-decompose: turn fresh triage tasks into ready workgraphs
         # before the dispatcher fans out workers. Gated by
         # ``kanban.auto_decompose`` (default True). Capped by
@@ -1696,8 +1734,8 @@ class GatewayKanbanWatchersMixin:
                 # and dispatch entirely — no new workers while paused. Running
                 # workers finish naturally; zombie reaping above still runs.
                 if not _kanban_dispatch_allowed():
-                    ready_pending = False
                     bad_ticks = 0
+                    last_benign_summary = ""
                 else:
                     # Re-read the auto-decompose toggle live each tick so a user
                     # flipping kanban.auto_decompose=false to STOP runaway fan-out
@@ -1723,21 +1761,32 @@ class GatewayKanbanWatchersMixin:
                                 res.promoted,
                                 len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
                             )
-                    # Health telemetry (aggregate across boards)
-                    ready_pending = await asyncio.to_thread(_ready_nonempty)
-                    if ready_pending and not any_spawned:
+                    # Health telemetry is derived from these exact dispatch
+                    # results.  A second board scan races task mutations and
+                    # loses the structured reason the dispatcher already knew.
+                    state, reason_summary = _dispatch_no_spawn_diagnostic(results)
+                    if not any_spawned and state == "actionable":
                         bad_ticks += 1
                     else:
                         bad_ticks = 0
+                    if not any_spawned and state == "benign":
+                        if reason_summary != last_benign_summary:
+                            logger.info(
+                                "kanban dispatcher idle: %s", reason_summary,
+                            )
+                        last_benign_summary = reason_summary
+                    else:
+                        last_benign_summary = ""
                 if bad_ticks >= HEALTH_WINDOW:
                     now = int(time.time())
                     if now - last_warn_at >= 300:
                         logger.warning(
-                            "kanban dispatcher stuck: ready queue non-empty for "
-                            "%d consecutive ticks but 0 workers spawned. Check "
+                            "kanban dispatcher stuck: 0 workers spawned for "
+                            "%d consecutive actionable ticks (%s). Check "
                             "profile health (venv, PATH, credentials) and "
                             "`hermes kanban list --status ready`.",
                             bad_ticks,
+                            reason_summary or "unexplained=1",
                         )
                         last_warn_at = now
             except asyncio.CancelledError:
